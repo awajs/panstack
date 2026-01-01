@@ -1,25 +1,25 @@
 from __future__ import annotations
 
+import datetime
 import glob
+import hashlib
+import json
 import math
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import cv2
 import numpy as np
 import rawpy
 
-# -----------------------------------------------------------------------------
-# Types
-# -----------------------------------------------------------------------------
 Box = Tuple[int, int, int, int]  # x, y, w, h
+_ALLOWED_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
 
 
 # -----------------------------------------------------------------------------
-# Robust color helpers
+# Color / dtype helpers
 # -----------------------------------------------------------------------------
 def ensure_bgr(img: np.ndarray) -> np.ndarray:
-    """Ensure image is 3-channel BGR."""
     if img is None:
         raise ValueError("ensure_bgr() got None")
     if img.ndim == 2:
@@ -33,15 +33,18 @@ def ensure_bgr(img: np.ndarray) -> np.ndarray:
     raise ValueError(f"Unexpected image shape in ensure_bgr: {img.shape}")
 
 
-def to_gray_u8(img: np.ndarray) -> np.ndarray:
-    """
-    Convert to grayscale uint8. Works for uint8/uint16/float.
-    ORB requires uint8.
-    """
-    if img is None:
-        raise ValueError("to_gray_u8() got None")
+def bgr_to_u8(bgr: np.ndarray) -> np.ndarray:
+    bgr = ensure_bgr(bgr)
+    if bgr.dtype == np.uint8:
+        return bgr
+    if bgr.dtype == np.uint16:
+        return (bgr >> 8).astype(np.uint8)
+    if np.issubdtype(bgr.dtype, np.floating):
+        return np.clip(bgr * 255.0, 0, 255).astype(np.uint8) if bgr.max() <= 1.0 else np.clip(bgr, 0, 255).astype(np.uint8)
+    return cv2.normalize(bgr, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
 
-    # Convert to gray (keeping dtype)
+
+def to_gray_u8(img: np.ndarray) -> np.ndarray:
     if img.ndim == 2:
         g = img
     elif img.ndim == 3 and img.shape[2] == 1:
@@ -53,28 +56,38 @@ def to_gray_u8(img: np.ndarray) -> np.ndarray:
     else:
         raise ValueError(f"Unexpected image shape in to_gray_u8: {img.shape}")
 
-    # Convert to uint8 safely
     if g.dtype == np.uint8:
         return g
     if g.dtype == np.uint16:
         return (g >> 8).astype(np.uint8)
-    # float or other integer types
-    g = np.clip(g, 0, 255).astype(np.uint8) if np.issubdtype(g.dtype, np.floating) else g
-    if g.dtype != np.uint8:
-        g = cv2.normalize(g, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    return g
+    if np.issubdtype(g.dtype, np.floating):
+        return np.clip(g * 255.0, 0, 255).astype(np.uint8) if g.max() <= 1.0 else np.clip(g, 0, 255).astype(np.uint8)
+    return cv2.normalize(g, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
 
 
-def bgr_to_u8(bgr: np.ndarray) -> np.ndarray:
-    """Convert BGR to uint8 BGR (for face detection & ORB), preserving shape."""
-    bgr = ensure_bgr(bgr)
-    if bgr.dtype == np.uint8:
-        return bgr
-    if bgr.dtype == np.uint16:
-        return (bgr >> 8).astype(np.uint8)
-    if np.issubdtype(bgr.dtype, np.floating):
-        return np.clip(bgr, 0, 255).astype(np.uint8)
-    return cv2.normalize(bgr, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+def brighten_for_detect(bgr_u8: np.ndarray, gain: float = 1.6, gamma: float = 0.6, clahe: bool = False) -> np.ndarray:
+    bgr_u8 = bgr_to_u8(bgr_u8)
+    x = bgr_u8.astype(np.float32) / 255.0
+    x = np.clip(x * max(gain, 0.0), 0.0, 1.0)
+    x = np.power(x, max(gamma, 1e-6))
+    y = (x * 255.0).astype(np.uint8)
+
+    if clahe:
+        lab = cv2.cvtColor(y, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        c = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        l2 = c.apply(l)
+        y = cv2.cvtColor(cv2.merge([l2, a, b]), cv2.COLOR_LAB2BGR)
+
+    return y
+
+
+def linear_to_srgb(linear01: np.ndarray) -> np.ndarray:
+    """Accurate sRGB transfer function. Input float in [0,1]."""
+    x = np.clip(linear01, 0.0, 1.0)
+    a = 0.055
+    out = np.where(x <= 0.0031308, x * 12.92, (1 + a) * np.power(x, 1 / 2.4) - a)
+    return out
 
 
 # -----------------------------------------------------------------------------
@@ -91,107 +104,97 @@ if not _FACE_MODEL.exists():
 _face_net = cv2.dnn.readNetFromCaffe(str(_FACE_PROTO), str(_FACE_MODEL))
 
 
-def detect_face_box(bgr: np.ndarray, conf_thresh: float = 0.5) -> Optional[Box]:
-    """
-    Return best face bounding box (x,y,w,h) or None.
-    Input should be uint8 BGR for best results.
-    """
-    bgr = bgr_to_u8(bgr)
-    h, w = bgr.shape[:2]
-
-    blob = cv2.dnn.blobFromImage(
-        cv2.resize(bgr, (300, 300)),
-        1.0,
-        (300, 300),
-        (104.0, 177.0, 123.0),
-    )
+def detect_face_boxes(bgr_u8: np.ndarray, conf_thresh: float = 0.5) -> List[Tuple[Box, float]]:
+    bgr_u8 = bgr_to_u8(bgr_u8)
+    h, w = bgr_u8.shape[:2]
+    blob = cv2.dnn.blobFromImage(cv2.resize(bgr_u8, (300, 300)), 1.0, (300, 300), (104.0, 177.0, 123.0))
     _face_net.setInput(blob)
     det = _face_net.forward()
 
-    best_box: Optional[Box] = None
-    best_conf = conf_thresh
-
+    out: List[Tuple[Box, float]] = []
     for i in range(det.shape[2]):
         conf = float(det[0, 0, i, 2])
-        if conf <= best_conf:
+        if conf < conf_thresh:
             continue
-
         box = det[0, 0, i, 3:7] * np.array([w, h, w, h])
         x1, y1, x2, y2 = box.astype(int)
-
-        x1 = max(0, x1)
-        y1 = max(0, y1)
-        x2 = min(w, x2)
-        y2 = min(h, y2)
-
+        x1 = max(0, x1); y1 = max(0, y1)
+        x2 = min(w, x2); y2 = min(h, y2)
         if x2 > x1 and y2 > y1:
-            best_box = (x1, y1, x2 - x1, y2 - y1)
-            best_conf = conf
+            out.append(((x1, y1, x2 - x1, y2 - y1), conf))
+    return out
 
-    return best_box
+
+def sort_boxes_for_ids(boxes: List[Tuple[Box, float]]) -> List[Box]:
+    return [b for (b, c) in sorted(boxes, key=lambda bc: (bc[0][2] * bc[0][3], bc[1]), reverse=True)]
 
 
 # -----------------------------------------------------------------------------
-# RAW loading
+# RAW loading (linear-ish)
 # -----------------------------------------------------------------------------
-def load_arw_bgr(path: str, scale: float = 0.5, bps: int = 8) -> np.ndarray:
-    """
-    Load Sony ARW using rawpy and return BGR image (uint8 if bps=8, uint16 if bps=16).
-    scale < 1.0 downscales for speed.
-    """
-    if bps not in (8, 16):
-        raise ValueError("bps must be 8 or 16")
-
+def load_arw_bgr_u16(path: str, scale: float = 0.5) -> np.ndarray:
+    """Decode RAW to uint16 BGR (linear-ish) without auto-brightening."""
     with rawpy.imread(path) as raw:
-        rgb = raw.postprocess(
+        rgb16 = raw.postprocess(
             use_camera_wb=True,
             no_auto_bright=True,
-            output_bps=bps,
-            gamma=(1, 1),
+            output_bps=16,
+            gamma=(1, 1),  # linear-ish
             user_flip=0,
         )
-
-    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-    bgr = ensure_bgr(bgr)
-
+    bgr16 = cv2.cvtColor(rgb16, cv2.COLOR_RGB2BGR)
+    bgr16 = ensure_bgr(bgr16)
     if scale != 1.0:
-        h, w = bgr.shape[:2]
-        bgr = cv2.resize(bgr, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+        h, w = bgr16.shape[:2]
+        bgr16 = cv2.resize(bgr16, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+    return bgr16
 
-    return bgr
+
+def u16_to_linear01(bgr_u16: np.ndarray) -> np.ndarray:
+    """uint16 BGR -> float32 linear [0,1] BGR"""
+    bgr_u16 = ensure_bgr(bgr_u16)
+    return (bgr_u16.astype(np.float32) / 65535.0)
 
 
 # -----------------------------------------------------------------------------
-# Face sharpness + face mask
+# Face sharpness + masks
 # -----------------------------------------------------------------------------
 def face_sharpness(bgr_u8: np.ndarray, box: Optional[Box]) -> float:
-    """Laplacian variance in face ROI on uint8 proxy."""
     if box is None:
         return 0.0
-    bgr_u8 = bgr_to_u8(bgr_u8)
     x, y, w, h = box
-    roi = bgr_u8[y : y + h, x : x + w]
+    roi = bgr_u8[y:y + h, x:x + w]
     if roi.size == 0:
         return 0.0
     g = to_gray_u8(roi)
     return float(cv2.Laplacian(g, cv2.CV_64F).var())
 
 
-def face_mask(shape: Tuple[int, int, int], box: Optional[Box], feather: float = 35.0, expand: float = 0.40) -> np.ndarray:
-    """Feathered expanded face-box mask. Returns (H,W,1) float in [0,1]."""
-    h, w = shape[:2]
+def faces_union_mask(shape_hw3: Tuple[int, int, int], boxes: List[Box], ids: Union[str, List[int]],
+                     feather: float = 35.0, expand: float = 0.40) -> np.ndarray:
+    h, w = shape_hw3[:2]
     m = np.zeros((h, w), dtype=np.float32)
-    if box is None:
+    if not boxes:
         return m[..., None]
 
-    x, y, bw, bh = box
-    pad = int(expand * max(bw, bh))
-    x0 = max(0, x - pad)
-    y0 = max(0, y - pad)
-    x1 = min(w, x + bw + pad)
-    y1 = min(h, y + bh + pad)
+    if ids == "all":
+        chosen = boxes
+    else:
+        chosen: List[Box] = []
+        for fid in ids:
+            j = fid - 1
+            if 0 <= j < len(boxes):
+                chosen.append(boxes[j])
+        if not chosen:
+            chosen = [boxes[0]]
 
-    m[y0:y1, x0:x1] = 1.0
+    for box in chosen:
+        x, y, bw, bh = box
+        pad = int(expand * max(bw, bh))
+        x0 = max(0, x - pad); y0 = max(0, y - pad)
+        x1 = min(w, x + bw + pad); y1 = min(h, y + bh + pad)
+        m[y0:y1, x0:x1] = 1.0
+
     m = cv2.GaussianBlur(m, (0, 0), feather)
     return np.clip(m, 0.0, 1.0)[..., None]
 
@@ -199,32 +202,22 @@ def face_mask(shape: Tuple[int, int, int], box: Optional[Box], feather: float = 
 # -----------------------------------------------------------------------------
 # Alignment on background (ORB on uint8 proxies)
 # -----------------------------------------------------------------------------
-def _mask_out_face(shape: Tuple[int, int, int], box: Optional[Box]) -> np.ndarray:
-    """Mask for ORB feature detection: 255 usable, 0 face region."""
-    h, w = shape[:2]
+def _mask_out_face(shape_hw3: Tuple[int, int, int], box: Optional[Box]) -> np.ndarray:
+    h, w = shape_hw3[:2]
     m = np.ones((h, w), dtype=np.uint8) * 255
     if box is None:
         return m
     x, y, bw, bh = box
     pad = int(0.25 * max(bw, bh))
-    x0 = max(0, x - pad)
-    y0 = max(0, y - pad)
-    x1 = min(w, x + bw + pad)
-    y1 = min(h, y + bh + pad)
+    x0 = max(0, x - pad); y0 = max(0, y - pad)
+    x1 = min(w, x + bw + pad); y1 = min(h, y + bh + pad)
     m[y0:y1, x0:x1] = 0
     return m
 
 
 def estimate_affine_orb(base_u8: np.ndarray, img_u8: np.ndarray, base_face: Optional[Box], img_face: Optional[Box]) -> Optional[np.ndarray]:
-    """
-    Estimate affine mapping img->base using ORB+RANSAC on uint8 grayscale.
-    """
-    base_u8 = bgr_to_u8(base_u8)
-    img_u8 = bgr_to_u8(img_u8)
-
     g1 = to_gray_u8(base_u8)
     g2 = to_gray_u8(img_u8)
-
     m1 = _mask_out_face(base_u8.shape, base_face)
     m2 = _mask_out_face(img_u8.shape, img_face)
 
@@ -247,9 +240,8 @@ def estimate_affine_orb(base_u8: np.ndarray, img_u8: np.ndarray, base_face: Opti
     return M
 
 
-def warp_affine(img: np.ndarray, M: np.ndarray, shape: Tuple[int, int, int]) -> np.ndarray:
-    """Warp supports uint8/uint16."""
-    h, w = shape[:2]
+def warp_affine(img: np.ndarray, M: np.ndarray, shape_hw3: Tuple[int, int, int]) -> np.ndarray:
+    h, w = shape_hw3[:2]
     return cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
 
 
@@ -276,87 +268,308 @@ def gaussian_weight(i: int, base_idx: int, k: int, sigma: float = 0.7) -> float:
 
 
 # -----------------------------------------------------------------------------
+# Extra synthetic motion blur (background only)
+# -----------------------------------------------------------------------------
+def motion_blur(img: np.ndarray, length: float, angle_deg: float) -> np.ndarray:
+    if length <= 0.0:
+        return img
+    length_i = max(3, int(round(length)))
+    k = np.zeros((length_i, length_i), dtype=np.float32)
+    k[length_i // 2, :] = 1.0
+    k /= max(k.sum(), 1e-6)
+
+    center = (length_i / 2.0, length_i / 2.0)
+    R = cv2.getRotationMatrix2D(center, angle_deg, 1.0)
+    k_rot = cv2.warpAffine(k, R, (length_i, length_i), flags=cv2.INTER_LINEAR)
+    s = k_rot.sum()
+    if s > 0:
+        k_rot /= s
+    return cv2.filter2D(img, -1, k_rot)
+
+
+def estimate_motion_angle_deg(translations: List[Tuple[float, float]]) -> Optional[float]:
+    if not translations:
+        return None
+    dx = float(np.mean([t[0] for t in translations]))
+    dy = float(np.mean([t[1] for t in translations]))
+    if abs(dx) < 1e-6 and abs(dy) < 1e-6:
+        return None
+    return math.degrees(math.atan2(dy, dx))
+
+
+# -----------------------------------------------------------------------------
+# Output naming + metadata writing (TIFF ICC)
+# -----------------------------------------------------------------------------
+def is_image_file_path(p: Path) -> bool:
+    return p.suffix.lower() in _ALLOWED_EXTS
+
+
+def make_unique_outpath(out_path: str, base_file: str, meta: dict, default_ext: str = ".tif") -> Path:
+    outp = Path(out_path)
+
+    if is_image_file_path(outp):
+        outp.parent.mkdir(parents=True, exist_ok=True)
+        return outp
+
+    out_dir = outp
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ext = default_ext
+
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    settings_blob = json.dumps(meta, sort_keys=True).encode("utf-8")
+    h = hashlib.sha1(settings_blob).hexdigest()[:8]
+    stem = Path(base_file).stem
+    faces_part = str(meta.get("freeze_faces"))
+
+    name = (
+        f"{stem}__B{meta.get('base_idx')}"
+        f"__k{meta.get('k')}_{meta.get('mode')}"
+        f"__align{1 if meta.get('align_bg') else 0}"
+        f"__faces{faces_part}"
+        f"__eb{meta.get('extra_blur')}_{meta.get('blur_angle')}"
+        f"__{ts}__{h}{ext}"
+    )
+    return out_dir / name
+
+
+def write_sidecar_json(image_path: Path, meta: dict) -> None:
+    sidecar = image_path.with_suffix(image_path.suffix + ".json")
+    sidecar.write_text(json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def srgb_icc_bytes() -> bytes:
+    # lightweight way to generate sRGB ICC
+    from PIL import ImageCms
+    prof = ImageCms.createProfile("sRGB")
+    return ImageCms.ImageCmsProfile(prof).tobytes()
+
+
+def save_image_with_metadata(path: Path, img_srgb01_bgr: np.ndarray, out_bps: int, meta: dict) -> None:
+    """
+    Save final image (sRGB encoded float [0,1], BGR order) with metadata.
+    - Always writes JSON sidecar.
+    - TIFF: embeds ImageDescription JSON + sRGB ICC profile (Photoshop-friendly)
+    - PNG/JPG: writes via OpenCV (fast) + sidecar (no ICC tagging there).
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_sidecar_json(path, meta)
+
+    ext = path.suffix.lower()
+
+    # convert BGR -> RGB for file formats
+    rgb01 = img_srgb01_bgr[..., ::-1].copy()
+
+    if out_bps == 16:
+        arr = np.clip(rgb01 * 65535.0 + 0.5, 0, 65535).astype(np.uint16)
+    else:
+        arr = np.clip(rgb01 * 255.0 + 0.5, 0, 255).astype(np.uint8)
+
+    if ext in [".tif", ".tiff"]:
+        import tifffile
+        desc = json.dumps(meta, sort_keys=True)
+        icc = srgb_icc_bytes()
+        tifffile.imwrite(str(path), arr, photometric="rgb", description=desc, metadata=None, iccprofile=icc)
+        return
+
+    # PNG/JPG fallback: OpenCV write (no ICC), but sidecar preserves settings
+    ok = cv2.imwrite(str(path), arr[..., ::-1])  # back to BGR for OpenCV
+    if not ok:
+        raise RuntimeError(f"Failed to write output: {path}")
+
+
+# -----------------------------------------------------------------------------
+# Auto exposure in linear space
+# -----------------------------------------------------------------------------
+def auto_expose_gain(linear01_bgr: np.ndarray, percentile: float = 99.5, target: float = 0.98,
+                     min_gain: float = 0.25, max_gain: float = 8.0) -> float:
+    """
+    Compute gain so that the given percentile of luminance maps near target.
+    """
+    # luminance in BGR: convert to RGB luminance weights
+    rgb = linear01_bgr[..., ::-1]
+    lum = 0.2126 * rgb[..., 0] + 0.7152 * rgb[..., 1] + 0.0722 * rgb[..., 2]
+    p = float(np.percentile(lum, percentile))
+    if p <= 1e-6:
+        return 1.0
+    g = target / p
+    return float(np.clip(g, min_gain, max_gain))
+
+
+# -----------------------------------------------------------------------------
 # Main pipeline
 # -----------------------------------------------------------------------------
 def make_panstack(
     in_dir: str,
     out_path: str,
-    k: int = 8,
-    mode: str = "symmetric",
+    k: int = 10,
+    mode: str = "trailing",
     scale: float = 0.5,
     weight_sigma: float = 0.7,
     face_conf: float = 0.5,
-    bps: int = 8,
+    align_bg: bool = True,
+    freeze_faces: Union[str, List[int]] = "1",
+    preview_faces: bool = False,
+    extra_blur: float = 0.0,
+    blur_angle: Union[str, float] = "auto",
+    detect_gain: float = 1.6,
+    detect_gamma: float = 0.6,
+    detect_clahe: bool = False,
+    out_bps: int = 16,
+    auto_expose: bool = True,
+    exposure_gain: float = 1.0,
+    expose_percentile: float = 99.5,
+    expose_target: float = 0.98,
+    min_gain: float = 0.25,
+    max_gain: float = 8.0,
 ) -> Dict[str, object]:
-    """
-    Create a panstack composite.
 
-    - If bps=8: everything runs on uint8.
-    - If bps=16: we still do face detection & ORB alignment on uint8 proxies,
-      but we warp/stack/composite the uint16 images for final output.
-
-    Returns info dict.
-    """
     in_dir_p = Path(in_dir)
     paths = sorted(glob.glob(str(in_dir_p / "*.ARW"))) + sorted(glob.glob(str(in_dir_p / "*.arw")))
     if not paths:
         raise FileNotFoundError(f"No ARW files found in: {in_dir}")
 
-    # Load render frames (uint8 or uint16)
-    frames: List[np.ndarray] = [load_arw_bgr(p, scale=scale, bps=bps) for p in paths]
+    # Decode all RAWs to uint16 BGR (linear-ish), then to float linear 0..1
+    frames_u16 = [load_arw_bgr_u16(p, scale=scale) for p in paths]
+    frames_lin = [u16_to_linear01(f) for f in frames_u16]  # float32 0..1 BGR
 
-    # Build uint8 proxies for detection & alignment (always)
-    frames_u8: List[np.ndarray] = [bgr_to_u8(f) for f in frames]
+    # Detection/alignment proxies (uint8, brightened)
+    frames_u8 = [brighten_for_detect(bgr_to_u8(f), gain=detect_gain, gamma=detect_gamma, clahe=detect_clahe) for f in frames_u16]
 
-    # Face boxes and sharpness computed on proxies
-    face_boxes: List[Optional[Box]] = [detect_face_box(f, conf_thresh=face_conf) for f in frames_u8]
-    sharp_scores: List[float] = [face_sharpness(f, b) for f, b in zip(frames_u8, face_boxes)]
+    # Determine base frame: best face sharpness (largest/most confident face per frame)
+    best_boxes: List[Optional[Box]] = []
+    scores: List[float] = []
+    for f8 in frames_u8:
+        dets = detect_face_boxes(f8, conf_thresh=face_conf)
+        boxes_sorted = sort_boxes_for_ids(dets)
+        box = boxes_sorted[0] if boxes_sorted else None
+        best_boxes.append(box)
+        scores.append(face_sharpness(f8, box))
 
-    base_idx = int(np.argmax(sharp_scores))
-    base = frames[base_idx]          # render base (uint8 or uint16)
-    base_u8 = frames_u8[base_idx]    # proxy base
-    base_face = face_boxes[base_idx]
+    base_idx = int(np.argmax(scores))
+    base_lin = frames_lin[base_idx]   # float linear
+    base_u8 = frames_u8[base_idx]
 
-    idxs = select_indices(len(frames), base_idx, k, mode)
+    # Detect all faces in base frame for selection
+    base_dets = detect_face_boxes(base_u8, conf_thresh=face_conf)
+    base_boxes = sort_boxes_for_ids(base_dets)
 
-    acc = np.zeros_like(base, dtype=np.float32)
+    # Preview
+    if preview_faces:
+        preview = base_u8.copy()
+        for i, b in enumerate(base_boxes, start=1):
+            x, y, w, h = b
+            cv2.rectangle(preview, (x, y), (x + w, y + h), (0, 255, 255), 2)
+            cv2.putText(preview, str(i), (x, max(0, y - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
+
+        outp = Path(out_path)
+        if is_image_file_path(outp):
+            prev_path = outp
+        else:
+            outp.mkdir(parents=True, exist_ok=True)
+            prev_path = outp / "preview_faces.png"
+
+        cv2.imwrite(str(prev_path), preview)
+        return {
+            "preview_faces": True,
+            "base_idx": base_idx,
+            "base_file": Path(paths[base_idx]).name,
+            "faces_found": len(base_boxes),
+            "preview_path": str(prev_path),
+            "detect_gain": detect_gain,
+            "detect_gamma": detect_gamma,
+            "detect_clahe": detect_clahe,
+        }
+
+    # Face mask union in base frame (applied in linear)
+    mask = faces_union_mask(base_lin.shape, base_boxes, freeze_faces, feather=35.0, expand=0.40)
+
+    # Select frames for stacking
+    idxs = select_indices(len(frames_lin), base_idx, k, mode)
+
+    acc = np.zeros_like(base_lin, dtype=np.float32)
     wsum = 0.0
     used = 0
+    translations: List[Tuple[float, float]] = []
 
     for i in idxs:
-        M = estimate_affine_orb(base_u8, frames_u8[i], base_face, face_boxes[i])
-        if M is None:
-            continue
-
-        fw = warp_affine(frames[i], M, base.shape)  # warp render frame
         w = gaussian_weight(i, base_idx, k, sigma=weight_sigma)
+
+        M = None
+        if align_bg or (blur_angle == "auto"):
+            M = estimate_affine_orb(frames_u8[base_idx], frames_u8[i], best_boxes[base_idx], best_boxes[i])
+
+        if M is not None:
+            translations.append((float(M[0, 2]), float(M[1, 2])))
+            fw = warp_affine(frames_lin[i], M, base_lin.shape) if align_bg else frames_lin[i]
+        else:
+            # fallback: still contribute unaligned (prevents frames_used=1)
+            fw = frames_lin[i]
+
         acc += fw.astype(np.float32) * w
         wsum += w
         used += 1
 
-    if used == 0:
-        raise RuntimeError("Alignment failed for all frames. Try different burst or adjust k/mode/face_conf.")
+    bg_lin = acc / max(wsum, 1e-6)
 
-    bg = (acc / max(wsum, 1e-6)).astype(base.dtype)
+    # Extra blur on background only (in linear)
+    angle_used = None
+    if extra_blur > 0:
+        if blur_angle == "auto":
+            angle_used = estimate_motion_angle_deg(translations) or 0.0
+        else:
+            angle_used = float(blur_angle)
+        bg_lin = motion_blur(bg_lin, length=extra_blur, angle_deg=angle_used)
 
-    m = face_mask(base.shape, base_face, feather=35.0, expand=0.40)
-    out = (base.astype(np.float32) * m + bg.astype(np.float32) * (1.0 - m)).astype(base.dtype)
+    # Composite in linear
+    out_lin = (base_lin * mask + bg_lin * (1.0 - mask)).astype(np.float32)
 
-    out_p = Path(out_path)
-    out_p.parent.mkdir(parents=True, exist_ok=True)
+    # Auto exposure (linear), then manual exposure gain
+    auto_g = 1.0
+    if auto_expose:
+        auto_g = auto_expose_gain(out_lin, percentile=expose_percentile, target=expose_target,
+                                  min_gain=min_gain, max_gain=max_gain)
+        out_lin = np.clip(out_lin * auto_g, 0.0, None)
 
-    ok = cv2.imwrite(str(out_p), out)
-    if not ok:
-        raise RuntimeError(f"Failed to write output: {out_p}")
+    out_lin = np.clip(out_lin * float(exposure_gain), 0.0, None)
 
-    return {
+    # Encode to sRGB
+    out_srgb = linear_to_srgb(out_lin)
+
+    # Metadata
+    meta = {
+        "tool": "panstack",
+        "version": "0.0.2",
+        "created": datetime.datetime.now().isoformat(timespec="seconds"),
+        "in_dir": str(in_dir_p),
         "base_idx": base_idx,
         "base_file": Path(paths[base_idx]).name,
-        "frames_total": len(frames),
+        "frames_total": len(frames_lin),
         "frames_used": used,
-        "mode": mode,
         "k": k,
+        "mode": mode,
         "scale": scale,
-        "bps": bps,
-        "out_path": str(out_p),
+        "align_bg": align_bg,
+        "freeze_faces": freeze_faces,
+        "faces_found_in_base": len(base_boxes),
+        "extra_blur": extra_blur,
+        "blur_angle": ("auto" if blur_angle == "auto" else float(blur_angle)),
+        "estimated_angle": angle_used,
+        "weight_sigma": weight_sigma,
+        "face_conf": face_conf,
+        "detect_gain": detect_gain,
+        "detect_gamma": detect_gamma,
+        "detect_clahe": detect_clahe,
+        "out_bps": out_bps,
+        "auto_expose": auto_expose,
+        "auto_gain_used": auto_g,
+        "exposure_gain": exposure_gain,
+        "expose_percentile": expose_percentile,
+        "expose_target": expose_target,
+        "min_gain": min_gain,
+        "max_gain": max_gain,
     }
+
+    final_path = make_unique_outpath(out_path, meta["base_file"], meta, default_ext=".tif")
+    save_image_with_metadata(final_path, out_srgb, out_bps, meta)
+    meta["out_path"] = str(final_path)
+    return meta
