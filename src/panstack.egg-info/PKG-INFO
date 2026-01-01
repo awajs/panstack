@@ -7,7 +7,6 @@ Description-Content-Type: text/markdown
 Requires-Dist: rawpy
 Requires-Dist: opencv-python
 Requires-Dist: numpy
-Requires-Dist: mediapipe
 
 # panstack
 

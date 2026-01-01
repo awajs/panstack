@@ -8,7 +8,6 @@ dependencies = [
   "rawpy",
   "opencv-python",
   "numpy",
-  "mediapipe",
 ]
 
 [project.scripts]

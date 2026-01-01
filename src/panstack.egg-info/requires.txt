@@ -1,4 +1,3 @@
 rawpy
 opencv-python
 numpy
-mediapipe

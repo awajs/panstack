@@ -1,21 +1,30 @@
 import argparse
+from panstack.pipeline import make_panstack
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(prog="panstack")
-    parser.add_argument("--in", dest="inp", required=True,
-                        help="Input burst folder containing ARW files")
-    parser.add_argument("--out", dest="out", required=True,
-                        help="Output image path (png/jpg)")
-    parser.add_argument("--k", type=int, default=8,
-                        help="Blur strength: number of frames around base")
-    parser.add_argument("--mode", choices=["symmetric", "trailing", "leading"],
-                        default="symmetric", help="Frame selection mode")
-    parser.add_argument("--scale", type=float, default=0.5,
-                        help="Decode scale for speed (1.0 = full res)")
+    parser.add_argument("--in", dest="inp", required=True)
+    parser.add_argument("--out", dest="out", required=True)
+    parser.add_argument("--k", type=int, default=8)
+    parser.add_argument("--mode", choices=["symmetric", "trailing", "leading"], default="symmetric")
+    parser.add_argument("--scale", type=float, default=0.5)
+    parser.add_argument("--weight-sigma", type=float, default=0.7)
+    parser.add_argument("--face-conf", type=float, default=0.5)
+    parser.add_argument("--bps", type=int, choices=[8, 16], default=8,
+                        help="Bit depth for RAW decode/output. Use 16 for grading.")
     args = parser.parse_args()
 
-    # TODO: implement pipeline.make_panstack(...) and call it here.
-    raise SystemExit("CLI stub. Next: implement src/panstack/pipeline.py and wire it here.")
+    info = make_panstack(
+        in_dir=args.inp,
+        out_path=args.out,
+        k=args.k,
+        mode=args.mode,
+        scale=args.scale,
+        weight_sigma=args.weight_sigma,
+        face_conf=args.face_conf,
+        bps=args.bps,
+    )
+    print("OK:", info)
 
 if __name__ == "__main__":
     main()
