@@ -1,0 +1,2 @@
+[console_scripts]
+panstack = panstack.cli:main

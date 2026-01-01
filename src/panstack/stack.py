@@ -1,0 +1,1 @@
+"""Frame selection + weighted stacking."""
