@@ -83,7 +83,6 @@ def brighten_for_detect(bgr_u8: np.ndarray, gain: float = 1.6, gamma: float = 0.
 
 
 def linear_to_srgb(linear01: np.ndarray) -> np.ndarray:
-    """Accurate sRGB transfer function. Input float in [0,1]."""
     x = np.clip(linear01, 0.0, 1.0)
     a = 0.055
     out = np.where(x <= 0.0031308, x * 12.92, (1 + a) * np.power(x, 1 / 2.4) - a)
@@ -133,13 +132,12 @@ def sort_boxes_for_ids(boxes: List[Tuple[Box, float]]) -> List[Box]:
 # RAW loading (linear-ish)
 # -----------------------------------------------------------------------------
 def load_arw_bgr_u16(path: str, scale: float = 0.5) -> np.ndarray:
-    """Decode RAW to uint16 BGR (linear-ish) without auto-brightening."""
     with rawpy.imread(path) as raw:
         rgb16 = raw.postprocess(
             use_camera_wb=True,
             no_auto_bright=True,
             output_bps=16,
-            gamma=(1, 1),  # linear-ish
+            gamma=(1, 1),
             user_flip=0,
         )
     bgr16 = cv2.cvtColor(rgb16, cv2.COLOR_RGB2BGR)
@@ -151,14 +149,72 @@ def load_arw_bgr_u16(path: str, scale: float = 0.5) -> np.ndarray:
 
 
 def u16_to_linear01(bgr_u16: np.ndarray) -> np.ndarray:
-    """uint16 BGR -> float32 linear [0,1] BGR"""
     bgr_u16 = ensure_bgr(bgr_u16)
     return (bgr_u16.astype(np.float32) / 65535.0)
 
 
 # -----------------------------------------------------------------------------
-# Face sharpness + masks
+# Masks (face / upper / full)
 # -----------------------------------------------------------------------------
+def region_box_from_face(face_box: Box, shape_hw3: Tuple[int, int, int], region: str) -> Box:
+    """
+    Expand a face box into a larger region box.
+    region:
+      - face: just the face
+      - upper: head+torso heuristic
+      - full: larger heuristic
+    """
+    h_img, w_img = shape_hw3[:2]
+    x, y, w, h = face_box
+
+    if region == "face":
+        x0, y0, x1, y1 = x, y, x + w, y + h
+    elif region == "upper":
+        x0 = x - int(0.30 * w)
+        y0 = y - int(0.20 * h)
+        x1 = x + w + int(0.30 * w)
+        y1 = y + int(4.50 * h)
+    elif region == "full":
+        x0 = x - int(0.60 * w)
+        y0 = y - int(0.20 * h)
+        x1 = x + w + int(0.60 * w)
+        y1 = y + int(7.50 * h)
+    else:
+        raise ValueError(f"Unknown freeze_region: {region}")
+
+    x0 = max(0, x0); y0 = max(0, y0)
+    x1 = min(w_img, x1); y1 = min(h_img, y1)
+
+    return (x0, y0, max(1, x1 - x0), max(1, y1 - y0))
+
+
+def boxes_union_mask(shape_hw3: Tuple[int, int, int], boxes: List[Box], feather: float = 35.0) -> np.ndarray:
+    h, w = shape_hw3[:2]
+    m = np.zeros((h, w), dtype=np.float32)
+    for (x, y, bw, bh) in boxes:
+        x0 = max(0, x); y0 = max(0, y)
+        x1 = min(w, x + bw); y1 = min(h, y + bh)
+        if x1 > x0 and y1 > y0:
+            m[y0:y1, x0:x1] = 1.0
+    m = cv2.GaussianBlur(m, (0, 0), feather)
+    return np.clip(m, 0.0, 1.0)[..., None]
+
+
+def select_face_boxes(face_boxes_sorted: List[Box], freeze_faces: Union[str, List[int]]) -> List[Box]:
+    if not face_boxes_sorted:
+        return []
+    if freeze_faces == "all":
+        return face_boxes_sorted
+    chosen: List[Box] = []
+    for fid in freeze_faces:
+        j = fid - 1
+        if 0 <= j < len(face_boxes_sorted):
+            chosen.append(face_boxes_sorted[j])
+    if not chosen:
+        chosen = [face_boxes_sorted[0]]
+    return chosen
+
+
 def face_sharpness(bgr_u8: np.ndarray, box: Optional[Box]) -> float:
     if box is None:
         return 0.0
@@ -168,35 +224,6 @@ def face_sharpness(bgr_u8: np.ndarray, box: Optional[Box]) -> float:
         return 0.0
     g = to_gray_u8(roi)
     return float(cv2.Laplacian(g, cv2.CV_64F).var())
-
-
-def faces_union_mask(shape_hw3: Tuple[int, int, int], boxes: List[Box], ids: Union[str, List[int]],
-                     feather: float = 35.0, expand: float = 0.40) -> np.ndarray:
-    h, w = shape_hw3[:2]
-    m = np.zeros((h, w), dtype=np.float32)
-    if not boxes:
-        return m[..., None]
-
-    if ids == "all":
-        chosen = boxes
-    else:
-        chosen: List[Box] = []
-        for fid in ids:
-            j = fid - 1
-            if 0 <= j < len(boxes):
-                chosen.append(boxes[j])
-        if not chosen:
-            chosen = [boxes[0]]
-
-    for box in chosen:
-        x, y, bw, bh = box
-        pad = int(expand * max(bw, bh))
-        x0 = max(0, x - pad); y0 = max(0, y - pad)
-        x1 = min(w, x + bw + pad); y1 = min(h, y + bh + pad)
-        m[y0:y1, x0:x1] = 1.0
-
-    m = cv2.GaussianBlur(m, (0, 0), feather)
-    return np.clip(m, 0.0, 1.0)[..., None]
 
 
 # -----------------------------------------------------------------------------
@@ -319,13 +346,13 @@ def make_unique_outpath(out_path: str, base_file: str, meta: dict, default_ext: 
     settings_blob = json.dumps(meta, sort_keys=True).encode("utf-8")
     h = hashlib.sha1(settings_blob).hexdigest()[:8]
     stem = Path(base_file).stem
-    faces_part = str(meta.get("freeze_faces"))
 
     name = (
         f"{stem}__B{meta.get('base_idx')}"
         f"__k{meta.get('k')}_{meta.get('mode')}"
         f"__align{1 if meta.get('align_bg') else 0}"
-        f"__faces{faces_part}"
+        f"__faces{meta.get('freeze_faces')}"
+        f"__reg{meta.get('freeze_region')}"
         f"__eb{meta.get('extra_blur')}_{meta.get('blur_angle')}"
         f"__{ts}__{h}{ext}"
     )
@@ -338,25 +365,16 @@ def write_sidecar_json(image_path: Path, meta: dict) -> None:
 
 
 def srgb_icc_bytes() -> bytes:
-    # lightweight way to generate sRGB ICC
     from PIL import ImageCms
     prof = ImageCms.createProfile("sRGB")
     return ImageCms.ImageCmsProfile(prof).tobytes()
 
 
 def save_image_with_metadata(path: Path, img_srgb01_bgr: np.ndarray, out_bps: int, meta: dict) -> None:
-    """
-    Save final image (sRGB encoded float [0,1], BGR order) with metadata.
-    - Always writes JSON sidecar.
-    - TIFF: embeds ImageDescription JSON + sRGB ICC profile (Photoshop-friendly)
-    - PNG/JPG: writes via OpenCV (fast) + sidecar (no ICC tagging there).
-    """
     path.parent.mkdir(parents=True, exist_ok=True)
     write_sidecar_json(path, meta)
 
     ext = path.suffix.lower()
-
-    # convert BGR -> RGB for file formats
     rgb01 = img_srgb01_bgr[..., ::-1].copy()
 
     if out_bps == 16:
@@ -371,8 +389,7 @@ def save_image_with_metadata(path: Path, img_srgb01_bgr: np.ndarray, out_bps: in
         tifffile.imwrite(str(path), arr, photometric="rgb", description=desc, metadata=None, iccprofile=icc)
         return
 
-    # PNG/JPG fallback: OpenCV write (no ICC), but sidecar preserves settings
-    ok = cv2.imwrite(str(path), arr[..., ::-1])  # back to BGR for OpenCV
+    ok = cv2.imwrite(str(path), arr[..., ::-1])
     if not ok:
         raise RuntimeError(f"Failed to write output: {path}")
 
@@ -382,10 +399,6 @@ def save_image_with_metadata(path: Path, img_srgb01_bgr: np.ndarray, out_bps: in
 # -----------------------------------------------------------------------------
 def auto_expose_gain(linear01_bgr: np.ndarray, percentile: float = 99.5, target: float = 0.98,
                      min_gain: float = 0.25, max_gain: float = 8.0) -> float:
-    """
-    Compute gain so that the given percentile of luminance maps near target.
-    """
-    # luminance in BGR: convert to RGB luminance weights
     rgb = linear01_bgr[..., ::-1]
     lum = 0.2126 * rgb[..., 0] + 0.7152 * rgb[..., 1] + 0.0722 * rgb[..., 2]
     p = float(np.percentile(lum, percentile))
@@ -408,6 +421,7 @@ def make_panstack(
     face_conf: float = 0.5,
     align_bg: bool = True,
     freeze_faces: Union[str, List[int]] = "1",
+    freeze_region: str = "face",
     preview_faces: bool = False,
     extra_blur: float = 0.0,
     blur_angle: Union[str, float] = "auto",
@@ -428,14 +442,14 @@ def make_panstack(
     if not paths:
         raise FileNotFoundError(f"No ARW files found in: {in_dir}")
 
-    # Decode all RAWs to uint16 BGR (linear-ish), then to float linear 0..1
+    # Decode RAWs to uint16 BGR then to float linear 0..1 (BGR)
     frames_u16 = [load_arw_bgr_u16(p, scale=scale) for p in paths]
-    frames_lin = [u16_to_linear01(f) for f in frames_u16]  # float32 0..1 BGR
+    frames_lin = [u16_to_linear01(f) for f in frames_u16]
 
     # Detection/alignment proxies (uint8, brightened)
     frames_u8 = [brighten_for_detect(bgr_to_u8(f), gain=detect_gain, gamma=detect_gamma, clahe=detect_clahe) for f in frames_u16]
 
-    # Determine base frame: best face sharpness (largest/most confident face per frame)
+    # Determine base frame by best face sharpness (best face per frame)
     best_boxes: List[Optional[Box]] = []
     scores: List[float] = []
     for f8 in frames_u8:
@@ -446,44 +460,39 @@ def make_panstack(
         scores.append(face_sharpness(f8, box))
 
     base_idx = int(np.argmax(scores))
-    base_lin = frames_lin[base_idx]   # float linear
+    base_lin = frames_lin[base_idx]
     base_u8 = frames_u8[base_idx]
 
-    # Detect all faces in base frame for selection
+    # Detect all faces in base for selection
     base_dets = detect_face_boxes(base_u8, conf_thresh=face_conf)
-    base_boxes = sort_boxes_for_ids(base_dets)
+    base_face_boxes_sorted = sort_boxes_for_ids(base_dets)
 
-    # Preview
+    # Preview faces
     if preview_faces:
         preview = base_u8.copy()
-        for i, b in enumerate(base_boxes, start=1):
+        for i, b in enumerate(base_face_boxes_sorted, start=1):
             x, y, w, h = b
             cv2.rectangle(preview, (x, y), (x + w, y + h), (0, 255, 255), 2)
             cv2.putText(preview, str(i), (x, max(0, y - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
 
         outp = Path(out_path)
-        if is_image_file_path(outp):
-            prev_path = outp
-        else:
-            outp.mkdir(parents=True, exist_ok=True)
-            prev_path = outp / "preview_faces.png"
-
+        prev_path = outp if is_image_file_path(outp) else (outp / "preview_faces.png")
+        prev_path.parent.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(str(prev_path), preview)
         return {
             "preview_faces": True,
             "base_idx": base_idx,
             "base_file": Path(paths[base_idx]).name,
-            "faces_found": len(base_boxes),
+            "faces_found": len(base_face_boxes_sorted),
             "preview_path": str(prev_path),
-            "detect_gain": detect_gain,
-            "detect_gamma": detect_gamma,
-            "detect_clahe": detect_clahe,
         }
 
-    # Face mask union in base frame (applied in linear)
-    mask = faces_union_mask(base_lin.shape, base_boxes, freeze_faces, feather=35.0, expand=0.40)
+    # Choose faces and convert to region boxes
+    chosen_faces = select_face_boxes(base_face_boxes_sorted, freeze_faces)
+    region_boxes = [region_box_from_face(fb, base_lin.shape, freeze_region) for fb in chosen_faces]
+    mask = boxes_union_mask(base_lin.shape, region_boxes, feather=35.0)
 
-    # Select frames for stacking
+    # Stack
     idxs = select_indices(len(frames_lin), base_idx, k, mode)
 
     acc = np.zeros_like(base_lin, dtype=np.float32)
@@ -502,16 +511,15 @@ def make_panstack(
             translations.append((float(M[0, 2]), float(M[1, 2])))
             fw = warp_affine(frames_lin[i], M, base_lin.shape) if align_bg else frames_lin[i]
         else:
-            # fallback: still contribute unaligned (prevents frames_used=1)
-            fw = frames_lin[i]
+            fw = frames_lin[i]  # fallback (prevents frames_used=1)
 
-        acc += fw.astype(np.float32) * w
+        acc += fw * w
         wsum += w
         used += 1
 
     bg_lin = acc / max(wsum, 1e-6)
 
-    # Extra blur on background only (in linear)
+    # extra blur (linear)
     angle_used = None
     if extra_blur > 0:
         if blur_angle == "auto":
@@ -520,25 +528,24 @@ def make_panstack(
             angle_used = float(blur_angle)
         bg_lin = motion_blur(bg_lin, length=extra_blur, angle_deg=angle_used)
 
-    # Composite in linear
+    # composite (linear)
     out_lin = (base_lin * mask + bg_lin * (1.0 - mask)).astype(np.float32)
 
-    # Auto exposure (linear), then manual exposure gain
+    # exposure (linear)
     auto_g = 1.0
     if auto_expose:
-        auto_g = auto_expose_gain(out_lin, percentile=expose_percentile, target=expose_target,
-                                  min_gain=min_gain, max_gain=max_gain)
+        auto_g = auto_expose_gain(out_lin, percentile=expose_percentile, target=expose_target, min_gain=min_gain, max_gain=max_gain)
         out_lin = np.clip(out_lin * auto_g, 0.0, None)
 
     out_lin = np.clip(out_lin * float(exposure_gain), 0.0, None)
 
-    # Encode to sRGB
+    # encode to sRGB
     out_srgb = linear_to_srgb(out_lin)
 
-    # Metadata
+    # metadata
     meta = {
         "tool": "panstack",
-        "version": "0.0.2",
+        "version": "0.0.3",
         "created": datetime.datetime.now().isoformat(timespec="seconds"),
         "in_dir": str(in_dir_p),
         "base_idx": base_idx,
@@ -550,7 +557,9 @@ def make_panstack(
         "scale": scale,
         "align_bg": align_bg,
         "freeze_faces": freeze_faces,
-        "faces_found_in_base": len(base_boxes),
+        "freeze_region": freeze_region,
+        "faces_found_in_base": len(base_face_boxes_sorted),
+        "chosen_faces_count": len(chosen_faces),
         "extra_blur": extra_blur,
         "blur_angle": ("auto" if blur_angle == "auto" else float(blur_angle)),
         "estimated_angle": angle_used,

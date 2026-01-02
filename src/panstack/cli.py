@@ -6,8 +6,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(prog="panstack")
 
     parser.add_argument("--in", dest="inp", required=True, help="Input burst folder containing ARW files")
-
-    # out can be a file or a directory
     parser.add_argument(
         "--out",
         dest="out",
@@ -26,6 +24,8 @@ def main() -> None:
     # face controls
     parser.add_argument("--freeze-faces", default="1",
                         help="Faces in base frame to keep sharp: '1' or '1,2' or 'all'")
+    parser.add_argument("--freeze-region", choices=["face", "upper", "full"], default="face",
+                        help="What to keep sharp around selected faces (base-frame): face, upper (head+torso), full (larger).")
     parser.add_argument("--preview-faces", action="store_true",
                         help="Write a preview image with numbered face boxes and exit")
     parser.add_argument("--face-conf", type=float, default=0.5, help="Face detection confidence threshold")
@@ -60,7 +60,6 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    # Parse freeze faces
     freeze = args.freeze_faces.strip().lower()
     if freeze == "all":
         freeze_faces = "all"
@@ -74,7 +73,6 @@ def main() -> None:
 
     align_bg = (args.align_bg == "on")
 
-    # Parse blur angle
     blur_angle_s = args.blur_angle.strip().lower()
     blur_angle_val = "auto" if blur_angle_s == "auto" else float(blur_angle_s)
 
@@ -88,6 +86,7 @@ def main() -> None:
         face_conf=args.face_conf,
         align_bg=align_bg,
         freeze_faces=freeze_faces,
+        freeze_region=args.freeze_region,
         preview_faces=args.preview_faces,
         extra_blur=args.extra_blur,
         blur_angle=blur_angle_val,
