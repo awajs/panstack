@@ -1,3 +1,4 @@
+MANIFEST.in
 README.md
 pyproject.toml
 src/panstack/__init__.py
@@ -14,3 +15,6 @@ src/panstack.egg-info/dependency_links.txt
 src/panstack.egg-info/entry_points.txt
 src/panstack.egg-info/requires.txt
 src/panstack.egg-info/top_level.txt
+src/panstack/models/deploy.prototxt
+src/panstack/models/res10_300x300_ssd_iter_140000.caffemodel
+src/panstack/models/selfie_multiclass_256x256.tflite

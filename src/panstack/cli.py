@@ -3,62 +3,71 @@ from panstack.pipeline import make_panstack
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(prog="panstack")
+    p = argparse.ArgumentParser(prog="panstack")
 
-    parser.add_argument("--in", dest="inp", required=True, help="Input burst folder containing ARW files")
-    parser.add_argument(
-        "--out",
-        dest="out",
-        required=True,
-        help="Output file (out.tif/out.png) OR output directory for auto-naming",
-    )
+    p.add_argument("--in", dest="inp", required=True, help="Input burst folder containing ARW files")
+    p.add_argument("--out", dest="out", required=True,
+                   help="Output file (out.tif/out.png) OR output directory for auto-naming")
 
-    # stacking controls
-    parser.add_argument("--k", type=int, default=10, help="Stack window size (frames around base)")
-    parser.add_argument("--mode", choices=["symmetric", "trailing", "leading"], default="trailing")
-    parser.add_argument("--scale", type=float, default=0.5, help="Decode scale (1.0=full res)")
-    parser.add_argument("--weight-sigma", type=float, default=0.7, help="Gaussian weight sigma (relative)")
-    parser.add_argument("--align-bg", choices=["on", "off"], default="on",
-                        help="Align background frames to base before stacking")
+    p.add_argument("--k", type=int, default=10)
+    p.add_argument("--mode", choices=["symmetric", "trailing", "leading"], default="trailing")
+    p.add_argument("--scale", type=float, default=0.5)
+    p.add_argument("--weight-sigma", type=float, default=0.7)
+    p.add_argument("--align-bg", choices=["on", "off"], default="on")
 
-    # face controls
-    parser.add_argument("--freeze-faces", default="1",
-                        help="Faces in base frame to keep sharp: '1' or '1,2' or 'all'")
-    parser.add_argument("--freeze-region", choices=["face", "upper", "full"], default="face",
-                        help="What to keep sharp around selected faces (base-frame): face, upper (head+torso), full (larger).")
-    parser.add_argument("--preview-faces", action="store_true",
-                        help="Write a preview image with numbered face boxes and exit")
-    parser.add_argument("--face-conf", type=float, default=0.5, help="Face detection confidence threshold")
+    p.add_argument("--bg-mode", choices=["blur", "stabilize", "stack"], default="blur")
+    p.add_argument("--bg-stack", choices=["mean", "median"], default="mean")
 
-    # motion blur controls
-    parser.add_argument("--extra-blur", type=float, default=0.0,
-                        help="Extra motion blur length in pixels applied to BACKGROUND only (0 disables)")
-    parser.add_argument("--blur-angle", default="auto",
-                        help="Motion blur angle in degrees, or 'auto' (estimated from burst motion)")
+    p.add_argument("--blur-scope", choices=["all", "foreground"], default="all")
+    p.add_argument("--bg-max-kernel", type=int, default=-1)
 
-    # detection-only brighten (does NOT change final render)
-    parser.add_argument("--detect-gain", type=float, default=1.6,
-                        help="Detection proxy gain (>1 brightens). Only affects face detect/alignment.")
-    parser.add_argument("--detect-gamma", type=float, default=0.6,
-                        help="Detection proxy gamma (<1 brightens shadows). Only affects face detect/alignment.")
-    parser.add_argument("--detect-clahe", action="store_true",
-                        help="Apply CLAHE to detection proxy (helps low-contrast faces).")
+    p.add_argument("--fg-motion", choices=["camera", "residual"], default="residual")
+    p.add_argument("--kernel-scale", type=float, default=1.0)
 
-    # output + color management
-    parser.add_argument("--bps", type=int, choices=[8, 16], default=16,
-                        help="Output bit depth (8 or 16).")
-    parser.add_argument("--auto-expose", choices=["on", "off"], default="on",
-                        help="Auto exposure on the final (linear) composite before sRGB encoding.")
-    parser.add_argument("--exposure-gain", type=float, default=1.0,
-                        help="Manual exposure multiplier in linear space (applied after auto-expose if enabled).")
-    parser.add_argument("--expose-percentile", type=float, default=99.5,
-                        help="Percentile for auto-expose (e.g., 99.5).")
-    parser.add_argument("--expose-target", type=float, default=0.98,
-                        help="Target value for percentile luminance (0..1).")
-    parser.add_argument("--min-gain", type=float, default=0.25, help="Min auto-expose gain clamp.")
-    parser.add_argument("--max-gain", type=float, default=8.0, help="Max auto-expose gain clamp.")
+    p.add_argument("--motion-roi", choices=["upper", "arms"], default="arms")
+    p.add_argument("--motion-feature", choices=["intensity", "edges"], default="edges")
 
-    args = parser.parse_args()
+    p.add_argument("--freeze-faces", default="all")
+    p.add_argument("--freeze-region", choices=["face", "upper", "full"], default="full")
+    p.add_argument("--preview-faces", action="store_true")
+    p.add_argument("--face-conf", type=float, default=0.5)
+
+    p.add_argument("--detect-gain", type=float, default=1.6)
+    p.add_argument("--detect-gamma", type=float, default=0.6)
+    p.add_argument("--detect-clahe", action="store_true")
+
+    p.add_argument("--bps", type=int, choices=[8, 16], default=16)
+    p.add_argument("--auto-expose", choices=["on", "off"], default="on")
+    p.add_argument("--exposure-gain", type=float, default=1.0)
+    p.add_argument("--expose-percentile", type=float, default=99.5)
+    p.add_argument("--expose-target", type=float, default=0.98)
+    p.add_argument("--min-gain", type=float, default=0.25)
+    p.add_argument("--max-gain", type=float, default=8.0)
+
+    p.add_argument("--blur-model", choices=["none", "trajectory"], default="trajectory")
+    p.add_argument("--bg-blur", type=float, default=1.0)
+    p.add_argument("--body-blur", type=float, default=0.8)
+    p.add_argument("--kernel-softness", type=float, default=0.0)
+    p.add_argument("--min-kernel", type=int, default=9)
+
+    p.add_argument("--debug-overlay", action="store_true")
+    p.add_argument("--debug-out", default="")
+
+    p.add_argument("--segmentation", choices=["off", "auto", "on"], default="auto")
+    p.add_argument("--seg-thresh", type=float, default=0.5)
+    p.add_argument("--seg-erode", type=int, default=0)
+    p.add_argument("--seg-dilate", type=int, default=0)
+    p.add_argument("--seg-feather", type=float, default=25.0)
+
+    p.add_argument("--face-opacity", type=float, default=1.0)
+    p.add_argument("--body-opacity", type=float, default=1.0)
+
+    p.add_argument("--align-model", choices=["affine", "homography"], default="homography")
+    p.add_argument("--align-quality", type=float, default=0.22)
+    p.add_argument("--align-ransac", type=float, default=3.0)
+    p.add_argument("--align-features", type=int, default=8000)
+
+    args = p.parse_args()
 
     freeze = args.freeze_faces.strip().lower()
     if freeze == "all":
@@ -71,10 +80,9 @@ def main() -> None:
                 if part:
                     freeze_faces.append(int(part))
 
-    align_bg = (args.align_bg == "on")
-
-    blur_angle_s = args.blur_angle.strip().lower()
-    blur_angle_val = "auto" if blur_angle_s == "auto" else float(blur_angle_s)
+    bg_mode = args.bg_mode
+    if bg_mode == "stack":
+        bg_mode = "stabilize"
 
     info = make_panstack(
         in_dir=args.inp,
@@ -84,12 +92,18 @@ def main() -> None:
         scale=args.scale,
         weight_sigma=args.weight_sigma,
         face_conf=args.face_conf,
-        align_bg=align_bg,
+        align_bg=(args.align_bg == "on"),
+        bg_mode=bg_mode,
+        bg_stack=args.bg_stack,
+        blur_scope=args.blur_scope,
+        bg_max_kernel=args.bg_max_kernel,
+        fg_motion=args.fg_motion,
+        kernel_scale=args.kernel_scale,
+        motion_roi=args.motion_roi,
+        motion_feature=args.motion_feature,
         freeze_faces=freeze_faces,
         freeze_region=args.freeze_region,
         preview_faces=args.preview_faces,
-        extra_blur=args.extra_blur,
-        blur_angle=blur_angle_val,
         detect_gain=args.detect_gain,
         detect_gamma=args.detect_gamma,
         detect_clahe=args.detect_clahe,
@@ -100,6 +114,24 @@ def main() -> None:
         expose_target=args.expose_target,
         min_gain=args.min_gain,
         max_gain=args.max_gain,
+        blur_model=args.blur_model,
+        bg_blur=args.bg_blur,
+        body_blur=args.body_blur,
+        kernel_softness=args.kernel_softness,
+        min_kernel=args.min_kernel,
+        debug_overlay=args.debug_overlay,
+        debug_out=args.debug_out,
+        segmentation=args.segmentation,
+        seg_thresh=args.seg_thresh,
+        seg_erode_px=args.seg_erode,
+        seg_dilate_px=args.seg_dilate,
+        seg_feather_px=args.seg_feather,
+        face_opacity=args.face_opacity,
+        body_opacity=args.body_opacity,
+        align_model=args.align_model,
+        align_quality_thresh=args.align_quality,
+        align_ransac_thresh=args.align_ransac,
+        align_nfeatures=args.align_features,
     )
 
     print("OK:", info)

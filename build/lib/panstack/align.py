@@ -1,0 +1,1 @@
+"""Background alignment utilities."""

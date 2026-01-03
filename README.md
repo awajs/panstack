@@ -1,185 +1,307 @@
 # panstack
 
-**panstack** is a computational photography tool for creating Pixel-style *action pan* images from Sony A6700 (or similar) burst RAWs.
+`panstack` is a computational photography tool for generating **Pixel-style “action pan”** images from burst RAWs (Sony A6700 tested, but works with similar cameras).
 
-It combines:
-- burst capture
-- background stacking
-- optional background alignment
-- selective face freezing
-- directional motion blur
-
-to produce images where **faces remain sharp** while **time and motion accumulate around them**.
-
-This is not a one-click effect.  
-It is a controllable pipeline designed for photographers who want repeatability and intent.
+It creates images where:
+- **selected faces (and optionally upper/full body regions) remain sharp** (taken from a chosen “base” frame)
+- the rest of the scene becomes a **time-accumulated motion field** via stacking and motion-shaped kernels
+- outputs are **color-managed** (linear processing → sRGB encoding) and **Photoshop-friendly** (TIFF with embedded sRGB ICC)
 
 ---
 
-## What panstack does
+## Key ideas
 
-Given a burst of RAW images:
+### 1) Base frame
+A “base” frame is selected automatically as the frame with the **sharpest detected face** (using an 8‑bit detection proxy). The base is the source of the **sharp/frozen region**.
 
-1. Selects a **base frame** automatically (sharpest detected face).
-2. Detects **all faces in the base frame**.
-3. Lets you choose which faces stay sharp:
-   - a specific face (`--freeze-faces 1`)
-   - multiple faces (`--freeze-faces 1,2`)
-   - all detected faces (`--freeze-faces all`)
-4. Builds a **motion-blurred background** by stacking frames:
-   - optionally aligned (Pixel-like)
-   - or unaligned (raw, chaotic motion)
-5. Optionally applies **extra directional motion blur**.
-6. Outputs:
-   - PNG / TIFF
-   - auto-named files
-   - sidecar JSON metadata
-   - embedded metadata in TIFF files
+### 2) Stacking
+A set of frames around the base are combined with a temporal weighting to form a stacked image. Stacking can be aligned (stabilized) or unaligned.
 
----
+### 3) Motion-shaped blur kernels (optional)
+Instead of a generic blur, `panstack` can build a blur kernel from the **actual burst motion path** (“trajectory” kernel). You can apply this blur per-region:
+- background (strong)
+- body region (medium)
+- frozen region (none)
 
-## What panstack deliberately does *not* do
+### 4) Background stabilization (optional)
+`panstack` can keep the background **sharp/stabilized** by using aligned stacking and skipping kernel blur on the background (and optionally using median stacking to remove ghosting).
 
-- It does **not** track faces across frames.
-- It does **not** do per-pixel optical-flow blur.
-- It does **not** try to look “perfect”.
-
-The aesthetic goal is:
-> *one frozen moment embedded in flowing time*  
-not synthetic realism.
-
----
-
-## Requirements
-
-- Python **3.10+** (3.11 recommended, **not** RC builds)
-- Windows / macOS / Linux
-- Camera bursts (Sony ARW tested)
-- CPU only (GPU not required)
-
-### Python dependencies
-
-Installed automatically:
-- `rawpy`
-- `opencv-python`
-- `numpy`
-- `tifffile`
+### 5) Output & metadata
+- Output can be a **file** or a **directory** (auto-naming).
+- A **sidecar JSON** is always written with all settings.
+- TIFF outputs embed the same JSON in TIFF **ImageDescription** and include an **sRGB ICC profile**.
 
 ---
 
 ## Installation
 
-```bash
-git clone https://github.com/<your-username>/panstack.git
-cd panstack
+### Requirements
+- Python 3.10+ (3.11 stable recommended)
+- Windows/macOS/Linux
+- CPU-only (GPU not required)
 
+### Install
+```bash
 python -m venv .venv
-source .venv/Scripts/activate   # Windows Git Bash
-# or: source .venv/bin/activate # macOS/Linux
+# Windows Git Bash:
+source .venv/Scripts/activate
+# macOS/Linux:
+# source .venv/bin/activate
 
 pip install -U pip
 pip install -e .
+pip install pillow tifffile
 ```
+
+### Face detector model files (OpenCV DNN)
+Place these in:
+`src/panstack/models/`
+
+- `deploy.prototxt`
+- `res10_300x300_ssd_iter_140000.caffemodel`
 
 ---
 
-## Directory structure
+## Directory layout
 
+Recommended working layout:
 ```
-panstack/
-├── src/panstack/
-│   ├── pipeline.py
-│   ├── cli.py
-│   └── models/
-│       ├── deploy.prototxt
-│       └── res10_300x300_ssd_iter_140000.caffemodel
-├── data/
-│   ├── bursts/      # input bursts (ignored by git)
-│   └── outputs/     # generated images + metadata
-└── README.md
-```
-
-Place each burst into its own folder:
-
-```
-data/bursts/session1/
-  DSC08801.ARW
-  DSC08802.ARW
-  ...
+data/
+  bursts/
+    session1/      # input ARW burst files
+  outputs/         # generated TIFF/PNG + JSON sidecars
 ```
 
 ---
 
 ## Quick start
 
-### 1. Preview detected faces
-
+### 1) Preview detected faces (numbered IDs)
 ```bash
 panstack --in data/bursts/session1 --out data/outputs --preview-faces
 ```
 
-Writes:
+Creates:
+- `data/outputs/preview_faces.png`
 
-```
-data/outputs/preview_faces.png
-```
+Faces are numbered **1..N** (1 is the most prominent face: largest area, then confidence).
 
-Faces are numbered starting at **1**.
-
----
-
-### 2. Generate a Pixel-style pan image
-
+### 2) Generate a typical Pixel-like action-pan
 ```bash
-panstack --in data/bursts/session1 --out data/outputs   --bps 16   --freeze-faces 1   --align-bg on   --k 12 --mode trailing   --extra-blur 16 --blur-angle auto
+panstack --in data/bursts/session1 --out data/outputs \
+  --freeze-faces 1 --freeze-region face \
+  --align-bg on \
+  --k 14 --mode trailing \
+  --blur-model trajectory \
+  --bg-mode blur --bg-blur 1.0 --body-blur 0.35 \
+  --bps 16
 ```
 
----
-
-### 3. Freeze *all* faces
-
+### 3) Sharp stabilized city background (no blur on background)
 ```bash
-panstack --in data/bursts/session1 --out data/outputs   --freeze-faces all   --align-bg on   --k 12 --mode trailing   --extra-blur 14
+panstack --in data/bursts/session1 --out data/outputs \
+  --bg-mode stabilize --bg-stack median \
+  --align-bg on \
+  --freeze-faces all --freeze-region face \
+  --k 14 --mode trailing \
+  --blur-model trajectory \
+  --body-blur 0.35 \
+  --bps 16
 ```
 
 ---
 
-## Output behavior
+# CLI Reference (all parameters)
 
-### Auto-naming
-
-If `--out` is a **directory**, panstack generates a unique filename encoding the settings.
-
-### Metadata
-
-For every output:
-- A sidecar JSON is written (`output.tif.json`)
-- If output is TIFF, the same JSON is embedded in the TIFF **ImageDescription** tag
+> Tip: `--out` can be either a filename (explicit) or a directory (auto-named output).
 
 ---
 
-## Key parameters (conceptual)
+## Input / Output
 
-- `--k`: temporal window (how much time is accumulated)
-- `--align-bg`: align background or not
-- `--freeze-faces`: which faces stay sharp
-- `--extra-blur`: synthetic directional blur
-- `--detect-gain`, `--detect-gamma`: detection-only brightening
+### `--in <path>` (required)
+Input directory containing burst RAW files (Sony `.ARW`).
+
+### `--out <path>` (required)
+Output **file** or **directory**.
+
+- If a file extension is present (`.tif`, `.tiff`, `.png`, `.jpg`), that exact filename is used.
+- Otherwise, `--out` is treated as a **directory**, and a unique name is generated.
 
 ---
 
-## Philosophy
+## Face selection & sharp region
 
-panstack treats the city as a **force** and people as **anchors**.
+### `--preview-faces`
+Writes a preview image showing detected face boxes with numeric IDs and exits.
 
-It is less about perfect reconstruction and more about:
-- attention
-- speed
-- pressure
-- isolation
+### `--freeze-faces <ids|all>`
+Which face IDs (from the base frame preview) should remain sharp.
+
+- `1` → keep face #1 sharp
+- `1,2` → keep faces #1 and #2 sharp
+- `all` → keep all detected faces sharp
+
+Default: `1`
+
+### `--freeze-region <face|upper|full>`
+Expands the sharp region around each selected face.
+
+- `face` (default): only face box
+- `upper`: head + torso heuristic region (good for waist-up shots)
+- `full`: larger region (useful when subject is fully visible)
+
+---
+
+## Background alignment & stabilization
+
+### `--align-bg <on|off>`
+Controls whether frames are geometrically aligned (warped) to the base frame.
+
+- `on` (default): Pixel-like stabilization; smoother smears; needed for sharp background stabilization.
+- `off`: raw stacking; more chaotic motion; can look more “in-camera”.
+
+### `--bg-mode <blur|stabilize>`
+Controls whether the background ends up motion-blurred or stabilized.
+
+- `blur` (default): background can be blurred via kernels (`--bg-blur`).
+- `stabilize`: background is kept sharp (aligned stack) and kernel blur is **skipped** on background.
+  - If you set `--bg-mode stabilize` while `--align-bg off`, the pipeline forces alignment on (and records it in metadata).
+
+### `--bg-stack <mean|median>`
+Only meaningful when `--bg-mode stabilize`.
+
+- `mean` (default): uses the aligned weighted stack result.
+- `median`: uses a median of aligned frames (when enough aligned frames are available) to reduce ghosting from moving people/cars.
+
+---
+
+## Temporal stacking controls
+
+### `--k <int>`
+Controls the **temporal window** size around the base frame.
+
+Typical values:
+- 6–10 subtle
+- 12–18 strong
+- 20+ very expressive / abstract
+
+### `--mode <symmetric|trailing|leading>`
+Which frames around the base frame are included.
+
+### `--weight-sigma <float>`
+Controls how strongly the stack weights concentrate around the base.
+
+Typical:
+- 0.5 crisp
+- 0.7 default
+- 1.0 stronger motion
+
+### `--scale <float>`
+Downscale factor for RAW decode (for speed). `1.0` is full resolution.
+
+---
+
+## Motion-shaped blur controls
+
+### `--blur-model <none|line|trajectory>`
+Selects how the motion blur kernel is created.
+
+- `none`: stacking only, no kernel blur
+- `line`: single direction line kernel derived from mean motion
+- `trajectory` (default): kernel is rasterized from the burst motion path
+
+### `--bg-blur <float>`
+Background blur amount (0..1 typical), only meaningful when `--bg-mode blur`.
+
+### `--body-blur <float>`
+Body-region blur strength (0..1 typical).
+
+### `--kernel-softness <float>`
+Gaussian smoothing applied to the kernel (in pixels).
+
+### `--min-kernel <int>`
+Minimum kernel size (odd).
+
+---
+
+## Face detection controls (proxy only)
+
+### `--face-conf <float>`
+Face detection confidence threshold.
+
+### `--detect-gain <float>`
+Gain multiplier for the detection proxy.
+
+### `--detect-gamma <float>`
+Gamma applied to detection proxy (values <1 brighten shadows).
+
+### `--detect-clahe`
+Apply CLAHE to detection proxy.
+
+---
+
+## Output bit depth & exposure
+
+### `--bps <8|16>`
+Output bit depth. 16 recommended for grading.
+
+### `--auto-expose <on|off>`
+Automatic exposure normalization in **linear space** before sRGB encoding.
+
+### `--exposure-gain <float>`
+Manual exposure multiplier applied after auto exposure (if enabled).
+
+### `--expose-percentile <float>`
+Percentile used for auto exposure.
+
+### `--expose-target <float>`
+Target luminance for the chosen percentile.
+
+### `--min-gain`, `--max-gain`
+Clamp the auto-exposure gain.
+
+---
+
+## Metadata & reproducibility
+
+For each output:
+- A sidecar JSON is written: `output.ext.json`
+- TIFFs embed the JSON in TIFF **ImageDescription**
+- TIFFs include an **sRGB ICC profile** (Photoshop-friendly)
+
+---
+
+## Practical presets
+
+### Pixel-like (balanced)
+```bash
+--k 14 --mode trailing --weight-sigma 0.7 --align-bg on --blur-model trajectory \
+--bg-mode blur --bg-blur 1.0 --body-blur 0.35 --kernel-softness 0.8
+```
+
+### Strong motion
+```bash
+--k 18 --mode trailing --weight-sigma 1.0 --align-bg on --blur-model trajectory \
+--bg-mode blur --bg-blur 1.0 --body-blur 0.25 --kernel-softness 1.2
+```
+
+### Sharp stabilized city background
+```bash
+--bg-mode stabilize --bg-stack median --align-bg on \
+--blur-model trajectory --body-blur 0.35
+```
+
+---
+
+## Notes / limitations
+
+- Stabilization of faces/bodies is base-frame freezing (not tracking across frames).
+- Per-region kernels use burst motion inferred from affine transforms (not full optical flow).
+- Median stabilization depends on having enough aligned frames.
 
 ---
 
 ## License
 
-MIT (or your preferred license)
+Choose your preferred license (MIT is a good default).
