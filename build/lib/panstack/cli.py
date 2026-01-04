@@ -67,6 +67,23 @@ def main() -> None:
     p.add_argument("--align-ransac", type=float, default=3.0)
     p.add_argument("--align-features", type=int, default=8000)
 
+    p.add_argument("--tonemap", default="off",
+                        choices=["off", "log", "log_knee", "reinhard_log"],
+                        help="Apply tone mapping after stacking (recommended for sky).")
+    p.add_argument("--tonemap-alpha", type=float, default=8.0,
+                        help="Tone map strength (higher compresses highlights more).")
+    p.add_argument("--tonemap-threshold", type=float, default=0.7,
+                        help="Knee threshold for log_knee (start compressing above this).")
+    p.add_argument("--tonemap-sky-only", action="store_true",
+                        help="Apply tonemap only to the sky region.")
+    p.add_argument("--tonemap-sky-heuristic", action="store_true",
+                        help="Use heuristic sky detector if no segmentation sky mask is available.")
+    p.add_argument("--tonemap-feather", type=int, default=8,
+                        help="Feather amount (sigma in px) for sky blend edge.")
+    p.add_argument("--tonemap-no-luma", action="store_true",
+                        help="Apply curve per-channel instead of luminance (more hue shift risk).")
+
+
     args = p.parse_args()
 
     freeze = args.freeze_faces.strip().lower()
@@ -82,7 +99,7 @@ def main() -> None:
 
     bg_mode = args.bg_mode
     if bg_mode == "stack":
-        bg_mode = "stabilize"
+        bg_mode = "blur"  # "stack" isn't a separate mode in this pipeline
 
     info = make_panstack(
         in_dir=args.inp,
@@ -132,7 +149,17 @@ def main() -> None:
         align_quality_thresh=args.align_quality,
         align_ransac_thresh=args.align_ransac,
         align_nfeatures=args.align_features,
+
+        # --- NEW: tonemap plumbing ---
+        tonemap=args.tonemap,
+        tonemap_alpha=args.tonemap_alpha,
+        tonemap_threshold=args.tonemap_threshold,
+        tonemap_sky_only=args.tonemap_sky_only,
+        tonemap_sky_heuristic=args.tonemap_sky_heuristic,
+        tonemap_feather=args.tonemap_feather,
+        tonemap_use_luma=(not args.tonemap_no_luma),
     )
+
 
     print("OK:", info)
 

@@ -12,6 +12,8 @@ import cv2
 import numpy as np
 import rawpy
 
+from panstack.tonemap import apply_tonemap, _apply_sky_only_tonemap, apply_highlight_tonemap
+
 Box = Tuple[int, int, int, int]
 _ALLOWED_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
 
@@ -630,6 +632,26 @@ def build_trajectory_kernel(
         k /= s
     return k
 
+def apply_kernel_roi(img: np.ndarray, kernel: np.ndarray, roi: Optional[Box]) -> np.ndarray:
+    """
+    Apply cv2.filter2D only inside an ROI to reduce memory usage.
+    If roi is None, applies to full image.
+    """
+    if roi is None:
+        return cv2.filter2D(img, -1, kernel)
+
+    x, y, w, h = [int(v) for v in roi]
+    H, W = img.shape[:2]
+    x = max(0, min(x, W - 1))
+    y = max(0, min(y, H - 1))
+    w = max(1, min(w, W - x))
+    h = max(1, min(h, H - y))
+
+    out = img.copy()
+    sub = img[y:y + h, x:x + w]
+    out[y:y + h, x:x + w] = cv2.filter2D(sub, -1, kernel)
+    return out
+
 
 def apply_kernel(img: np.ndarray, kernel: np.ndarray) -> np.ndarray:
     return cv2.filter2D(img, -1, kernel)
@@ -844,6 +866,13 @@ def make_panstack(
     align_quality_thresh: float = 0.22,
     align_ransac_thresh: float = 3.0,
     align_nfeatures: int = 8000,
+    tonemap: str = "off",  # "off"|"log"|"log_knee"|"reinhard_log"
+    tonemap_alpha: float = 8.0,
+    tonemap_threshold: float = 0.7,
+    tonemap_sky_only: bool = False,
+    tonemap_sky_heuristic: bool = False,
+    tonemap_feather: int = 8,
+    tonemap_use_luma: bool = True,
 ) -> Dict[str, object]:
 
     disp_debug: List[Tuple[float, float]] = []
@@ -1035,7 +1064,7 @@ def make_panstack(
         body_strength = float(np.clip(body_blur, 0.0, 1.0))
         k_body = (1.0 - body_strength) * ident + body_strength * ktraj
         k_body /= max(float(k_body.sum()), 1e-6)
-        body_blurred = apply_kernel(stacked_lin, k_body)
+        body_blurred = apply_kernel_roi(stacked_lin, k_body, upper_roi_box)
 
     # Memory-safe opacity compositing (reuse one tmp buffer)
     fo = float(np.clip(face_opacity, 0.0, 1.0))
@@ -1080,6 +1109,47 @@ def make_panstack(
 
     out_lin = np.clip(out_lin * float(exposure_gain), 0.0, None)
     out_srgb = linear_to_srgb(out_lin)
+
+    # -------------------------------------------------------------------------
+    # Tone mapping (apply in sRGB space, after exposure, before saving)
+    # -------------------------------------------------------------------------
+    tm_mode = tonemap.strip().lower()
+    if tm_mode not in ("", "off", "none"):
+        if tonemap_sky_only:
+            if tonemap_sky_heuristic:
+                out_srgb = _apply_sky_only_tonemap(
+                    out_srgb,
+                    mode=tm_mode,
+                    alpha=float(tonemap_alpha),
+                    threshold=float(tonemap_threshold),
+                    use_luma=bool(tonemap_use_luma),
+                    feather=int(tonemap_feather),
+                    sky_mask=None,
+                    allow_heuristic=True,
+                )
+            else:
+                out_srgb = apply_highlight_tonemap(
+                    out_srgb,
+                    mode=tm_mode,
+                    alpha=float(tonemap_alpha),
+                    threshold=float(tonemap_threshold),
+                    use_luma=bool(tonemap_use_luma),
+                    hi_start=0.55,
+                    hi_end=0.92,
+                    top_bias=0.85,
+                    feather=int(tonemap_feather),
+                )
+        else:
+            out_srgb = apply_tonemap(
+                out_srgb,
+                mode=tm_mode,
+                alpha=float(tonemap_alpha),
+                threshold=float(tonemap_threshold),
+                use_luminance=bool(tonemap_use_luma),
+            )
+        out_srgb = np.clip(out_srgb, 0.0, 1.0)
+
+
 
     meta = {
         "tool": "panstack",
@@ -1146,6 +1216,14 @@ def make_panstack(
         "body_opacity": bo,
         "face_model_loaded": _face_net is not None,
         "face_model_error": _face_load_error,
+        "tonemap": tm_mode if tm_mode not in ("", "off", "none") else "off",
+        "tonemap_alpha": float(tonemap_alpha),
+        "tonemap_threshold": float(tonemap_threshold),
+        "tonemap_sky_only": bool(tonemap_sky_only),
+        "tonemap_sky_heuristic": bool(tonemap_sky_heuristic),
+        "tonemap_feather": int(tonemap_feather),
+        "tonemap_use_luma": bool(tonemap_use_luma),
+
     }
 
     if debug_overlay:
@@ -1165,6 +1243,20 @@ def make_panstack(
 
         dbg_path = Path(debug_out.strip()) if debug_out.strip() else _default_debug_path(out_path, meta["base_file"])
         dbg_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Optional: write sky mask debug if using heuristic sky-only tonemap
+        if tm_mode not in ("", "off", "none") and tonemap_sky_only and tonemap_sky_heuristic:
+            try:
+                # Recompute a sky mask the same way the tonemap helper does (heuristic)
+                from panstack.sky_mask import heuristic_sky_mask
+                sky = heuristic_sky_mask(bgr_to_u8(out_srgb))  # bool HxW
+                sky_path = dbg_path.with_name(dbg_path.stem + ".sky_mask.png")
+                cv2.imwrite(str(sky_path), (sky.astype(np.uint8) * 255))
+                meta["debug_sky_mask_path"] = str(sky_path)
+            except Exception as e:
+                meta["debug_sky_mask_error"] = f"{type(e).__name__}: {e}"
+
+
         cv2.imwrite(str(dbg_path), overlay)
         meta["debug_overlay_path"] = str(dbg_path)
 

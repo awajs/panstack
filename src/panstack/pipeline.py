@@ -12,6 +12,8 @@ import cv2
 import numpy as np
 import rawpy
 
+from panstack.tonemap import apply_tonemap, _apply_sky_only_tonemap, apply_highlight_tonemap
+
 Box = Tuple[int, int, int, int]
 _ALLOWED_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
 
@@ -141,8 +143,14 @@ def brighten_for_detect(bgr_u8: np.ndarray, gain: float = 1.6, gamma: float = 0.
     return y
 
 
-def linear_to_srgb(linear01: np.ndarray) -> np.ndarray:
-    x = np.clip(linear01, 0.0, 1.0)
+def linear_to_srgb(linear: np.ndarray, white: float = 1.0) -> np.ndarray:
+    """
+    Convert linear BGR to sRGB BGR.
+    `linear` may be in sensor scale (0…65535) or any positive scale.
+    `white` is the value in `linear` that should map to sRGB 1.0.
+    """
+    x = linear.astype(np.float32) / max(float(white), 1e-6)
+    x = np.clip(x, 0.0, 1.0)
     a = 0.055
     return np.where(x <= 0.0031308, x * 12.92, (1 + a) * np.power(x, 1 / 2.4) - a)
 
@@ -298,10 +306,10 @@ def load_arw_bgr_u16(path: str, scale: float = 0.5) -> np.ndarray:
     return bgr16
 
 
-def u16_to_linear01(bgr_u16: np.ndarray) -> np.ndarray:
-    out = ensure_bgr(bgr_u16).astype(np.float32)
-    out *= (1.0 / 65535.0)
-    return out
+def u16_to_linear_f32(bgr_u16):
+    # Keep sensor scale (0…65535)
+    return ensure_bgr(bgr_u16).astype(np.float32)
+
 
 
 # -----------------------------------------------------------------------------
@@ -713,8 +721,8 @@ def stack_background_plate(
             continue
 
         warp_image_prealloc(frames_u16[i], T, warp_u16, align_model, border_value=0)
-        warp_f32[:] = warp_u16
-        warp_f32 *= (1.0 / 65535.0)
+        warp_f32[:] = warp_u16.astype(np.float32)  # keep 0…65535 scale
+
 
         valid1 = warp_valid_mask(T, frames_u16[base_idx].shape, align_model)  # HxW
         wmap[:] = bg_keep3
@@ -798,19 +806,31 @@ def save_image_with_metadata(path: Path, img_srgb01_bgr: np.ndarray, out_bps: in
 # Auto exposure in linear space
 # -----------------------------------------------------------------------------
 def auto_expose_gain(
-    linear01_bgr: np.ndarray,
+    linear_bgr: np.ndarray,
     percentile: float = 99.5,
     target: float = 0.98,
     min_gain: float = 0.25,
     max_gain: float = 8.0,
 ) -> float:
-    rgb = linear01_bgr[..., ::-1]
+    rgb = linear_bgr[..., ::-1].astype(np.float32)
     lum = 0.2126 * rgb[..., 0] + 0.7152 * rgb[..., 1] + 0.0722 * rgb[..., 2]
+
     p = float(np.percentile(lum, percentile))
     if p <= 1e-6:
         return 1.0
-    g = target / p
+
+    # Gain to bring that percentile down/up to target *relative to p*.
+    # This is scale-invariant (works for 0..1 or 0..65535).
+    g = (target * p) / p  # = target, so not useful alone.
+    # Instead: use target against a fixed reference after temporary normalization:
+    lum01 = lum / p
+    p2 = float(np.percentile(lum01, percentile))
+    if p2 <= 1e-6:
+        return 1.0
+    g = target / p2
+
     return float(np.clip(g, min_gain, max_gain))
+
 
 
 # -----------------------------------------------------------------------------
@@ -864,6 +884,13 @@ def make_panstack(
     align_quality_thresh: float = 0.22,
     align_ransac_thresh: float = 3.0,
     align_nfeatures: int = 8000,
+    tonemap: str = "off",  # "off"|"log"|"log_knee"|"reinhard_log"
+    tonemap_alpha: float = 8.0,
+    tonemap_threshold: float = 0.7,
+    tonemap_sky_only: bool = False,
+    tonemap_sky_heuristic: bool = False,
+    tonemap_feather: int = 8,
+    tonemap_use_luma: bool = True,
 ) -> Dict[str, object]:
 
     disp_debug: List[Tuple[float, float]] = []
@@ -874,7 +901,7 @@ def make_panstack(
         raise FileNotFoundError(f"No ARW files found in: {in_dir}")
 
     frames_u16 = [load_arw_bgr_u16(p, scale=scale) for p in paths]
-    frames_lin = [u16_to_linear01(f) for f in frames_u16]  # base + final
+    frames_lin = [u16_to_linear_f32(f) for f in frames_u16]
     frames_u8 = [brighten_for_detect(bgr_to_u8(f), gain=detect_gain, gamma=detect_gamma, clahe=detect_clahe) for f in frames_u16]
 
     # base selection via sharpest face
@@ -1009,8 +1036,8 @@ def make_panstack(
             continue
 
         warp_image_prealloc(frames_u16[i], T, warp_u16, align_model, border_value=0)
-        warp_f32[:] = warp_u16
-        warp_f32 *= (1.0 / 65535.0)
+        warp_f32[:] = warp_u16.astype(np.float32)  # keep 0…65535 scale
+
 
         valid = warp_valid_mask(T, base_lin.shape, align_model).astype(np.float32)
         wmap = (w * valid)[..., None].astype(np.float32)
@@ -1099,7 +1126,63 @@ def make_panstack(
         out_lin = np.clip(out_lin * auto_g, 0.0, None)
 
     out_lin = np.clip(out_lin * float(exposure_gain), 0.0, None)
-    out_srgb = linear_to_srgb(out_lin)
+
+    # -------------------------------------------------
+    # FINAL NORMALIZATION (choose white point, then sRGB)
+    # -------------------------------------------------
+    white_percentile = 99.9  # good default; try 99.7–99.95 if needed
+    rgb = out_lin[..., ::-1]
+    lum = 0.2126 * rgb[..., 0] + 0.7152 * rgb[..., 1] + 0.0722 * rgb[..., 2]
+    white = float(np.percentile(lum, white_percentile))
+
+    # Convert to sRGB using that white point
+    out_srgb = linear_to_srgb(out_lin, white=white)
+
+    # Save white point in meta (optional but helpful)
+    # meta["white_percentile"] = white_percentile
+    # meta["white_value"] = white
+
+
+    # -------------------------------------------------------------------------
+    # Tone mapping (apply in sRGB space, after exposure, before saving)
+    # -------------------------------------------------------------------------
+    tm_mode = tonemap.strip().lower()
+    if tm_mode not in ("", "off", "none"):
+        if tonemap_sky_only:
+            if tonemap_sky_heuristic:
+                out_srgb = _apply_sky_only_tonemap(
+                    out_srgb,
+                    mode=tm_mode,
+                    alpha=float(tonemap_alpha),
+                    threshold=float(tonemap_threshold),
+                    use_luma=bool(tonemap_use_luma),
+                    feather=int(tonemap_feather),
+                    sky_mask=None,
+                    allow_heuristic=True,
+                )
+            else:
+                out_srgb = apply_highlight_tonemap(
+                    out_srgb,
+                    mode=tm_mode,
+                    alpha=float(tonemap_alpha),
+                    threshold=float(tonemap_threshold),
+                    use_luma=bool(tonemap_use_luma),
+                    hi_start=0.50,
+                    hi_end=0.97,
+                    top_bias=0.85,
+                    feather=int(tonemap_feather),
+                )
+        else:
+            out_srgb = apply_tonemap(
+                out_srgb,
+                mode=tm_mode,
+                alpha=float(tonemap_alpha),
+                threshold=float(tonemap_threshold),
+                use_luminance=bool(tonemap_use_luma),
+            )
+        out_srgb = np.clip(out_srgb, 0.0, 1.0)
+
+
 
     meta = {
         "tool": "panstack",
@@ -1166,6 +1249,14 @@ def make_panstack(
         "body_opacity": bo,
         "face_model_loaded": _face_net is not None,
         "face_model_error": _face_load_error,
+        "tonemap": tm_mode if tm_mode not in ("", "off", "none") else "off",
+        "tonemap_alpha": float(tonemap_alpha),
+        "tonemap_threshold": float(tonemap_threshold),
+        "tonemap_sky_only": bool(tonemap_sky_only),
+        "tonemap_sky_heuristic": bool(tonemap_sky_heuristic),
+        "tonemap_feather": int(tonemap_feather),
+        "tonemap_use_luma": bool(tonemap_use_luma),
+
     }
 
     if debug_overlay:
@@ -1185,6 +1276,20 @@ def make_panstack(
 
         dbg_path = Path(debug_out.strip()) if debug_out.strip() else _default_debug_path(out_path, meta["base_file"])
         dbg_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Optional: write sky mask debug if using heuristic sky-only tonemap
+        if tm_mode not in ("", "off", "none") and tonemap_sky_only and tonemap_sky_heuristic:
+            try:
+                # Recompute a sky mask the same way the tonemap helper does (heuristic)
+                from panstack.sky_mask import heuristic_sky_mask
+                sky = heuristic_sky_mask(bgr_to_u8(out_srgb))  # bool HxW
+                sky_path = dbg_path.with_name(dbg_path.stem + ".sky_mask.png")
+                cv2.imwrite(str(sky_path), (sky.astype(np.uint8) * 255))
+                meta["debug_sky_mask_path"] = str(sky_path)
+            except Exception as e:
+                meta["debug_sky_mask_error"] = f"{type(e).__name__}: {e}"
+
+
         cv2.imwrite(str(dbg_path), overlay)
         meta["debug_overlay_path"] = str(dbg_path)
 

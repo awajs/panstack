@@ -3,12 +3,15 @@ README.md
 pyproject.toml
 src/panstack/__init__.py
 src/panstack/align.py
+src/panstack/apply_tonemap.py
 src/panstack/cli.py
 src/panstack/composite.py
 src/panstack/face.py
 src/panstack/io_raw.py
 src/panstack/pipeline.py
+src/panstack/sky_mask.py
 src/panstack/stack.py
+src/panstack/tonemap.py
 src/panstack.egg-info/PKG-INFO
 src/panstack.egg-info/SOURCES.txt
 src/panstack.egg-info/dependency_links.txt
